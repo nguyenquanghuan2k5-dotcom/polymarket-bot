@@ -6,18 +6,18 @@ Features:
   3. Trending Market Scan — every 2 hours, top 5 markets by edge
   4. Morning Report — daily at 7:00 AM GMT+7
   5. Price Movement Alert — alerts when YES price moves >10% in 1 hour
+  6. /status command — reply to Telegram commands with live bot stats
 """
 
 import os
+import re
 import time
 import logging
+import threading
 import requests
 import anthropic
 import schedule
-import asyncio
 from datetime import datetime, timezone, timedelta
-from telegram import Bot
-from telegram.error import TelegramError
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -38,8 +38,19 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 POLYMARKET_BASE = "https://gamma-api.polymarket.com/markets"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
-# In-memory price tracker: market_id -> {price: float, timestamp: datetime}
+# In-memory price tracker: market_id -> {price: float, timestamp: datetime, title: str}
 price_history: dict[str, dict] = {}
+
+# Bot startup time (UTC)
+BOT_START_TIME = datetime.now(timezone.utc)
+
+# Last run timestamps for each feature (UTC), updated after each execution
+last_run: dict[str, datetime | None] = {
+    "new_markets": None,
+    "price_movements": None,
+    "trending_scan": None,
+    "morning_report": None,
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,11 +71,13 @@ def fetch_markets(params: dict, retries: int = 3) -> list[dict]:
     return []
 
 
-def send_telegram(message: str) -> None:
-    """Send a Telegram message synchronously using requests (no async needed)."""
+def send_telegram(message: str, chat_id: str | None = None) -> None:
+    """Send a Telegram message synchronously using requests (no async needed).
+    If chat_id is None, defaults to the configured TELEGRAM_CHAT_ID."""
+    target = chat_id or TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": target,
         "text": message,
         "parse_mode": "HTML",
     }
@@ -145,7 +158,6 @@ def is_politics_economics(market: dict) -> bool:
 def minutes_ago(created_at_str: str) -> int:
     """Return how many minutes ago a market was created."""
     try:
-        # Handle both ISO formats
         created_at_str = created_at_str.replace("Z", "+00:00")
         created = datetime.fromisoformat(created_at_str)
         now = datetime.now(timezone.utc)
@@ -162,6 +174,26 @@ def market_url(market: dict) -> str:
     return "https://polymarket.com"
 
 
+def format_timedelta(td: timedelta) -> str:
+    """Format a timedelta into a human-readable string like '1h 23m'."""
+    total_seconds = int(td.total_seconds())
+    if total_seconds < 0:
+        return "now"
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def format_last_run(ts: datetime | None) -> str:
+    """Format a last-run timestamp as 'X ago' or 'never'."""
+    if ts is None:
+        return "never"
+    delta = datetime.now(timezone.utc) - ts
+    return f"{format_timedelta(delta)} ago"
+
+
 # ---------------------------------------------------------------------------
 # Feature 1: New Market Alert (every 30 minutes)
 # ---------------------------------------------------------------------------
@@ -176,7 +208,6 @@ def check_new_markets() -> None:
     }
     markets = fetch_markets(params)
     now = datetime.now(timezone.utc)
-    two_hours_ago = now - timedelta(hours=2)
 
     alerted = 0
     for market in markets:
@@ -225,6 +256,7 @@ def check_new_markets() -> None:
             "title": title,
         }
 
+    last_run["new_markets"] = datetime.now(timezone.utc)
     log.info(f"New market check complete. Alerted on {alerted} market(s).")
 
 
@@ -248,6 +280,7 @@ def trending_market_scan() -> None:
     markets = fetch_markets(params)
     if not markets:
         log.warning("No markets returned for trending scan.")
+        last_run["trending_scan"] = datetime.now(timezone.utc)
         return
 
     # Collect edge estimates for top markets
@@ -261,10 +294,7 @@ def trending_market_scan() -> None:
         # Parse edge from Claude response (look for numeric edge mention)
         edge_estimate = 0.0
         for line in analysis.split("\n"):
-            line_lower = line.lower()
-            if "edge" in line_lower:
-                # Try to extract a number like "+5%", "-3%", "5 percentage points"
-                import re
+            if "edge" in line.lower():
                 numbers = re.findall(r"[+-]?\d+(?:\.\d+)?", line)
                 if numbers:
                     try:
@@ -300,6 +330,7 @@ def trending_market_scan() -> None:
         )
 
     send_telegram("\n".join(lines))
+    last_run["trending_scan"] = datetime.now(timezone.utc)
     log.info("Trending scan complete.")
 
 
@@ -318,6 +349,7 @@ def morning_report() -> None:
     markets = fetch_markets(params)
     if not markets:
         log.warning("No markets for morning report.")
+        last_run["morning_report"] = datetime.now(timezone.utc)
         return
 
     top5 = markets[:5]
@@ -337,6 +369,7 @@ def morning_report() -> None:
         )
 
     send_telegram("\n".join(lines))
+    last_run["morning_report"] = datetime.now(timezone.utc)
     log.info("Morning report sent.")
 
 
@@ -389,7 +422,120 @@ def check_price_movements() -> None:
         # Always update the latest price
         price_history[mid] = {"price": current_price, "timestamp": now, "title": title}
 
+    last_run["price_movements"] = datetime.now(timezone.utc)
     log.info("Price movement check complete.")
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: /status command — Telegram command polling
+# ---------------------------------------------------------------------------
+
+def build_status_message() -> str:
+    """Build a status message with live bot statistics."""
+    now = datetime.now(timezone.utc)
+
+    # Uptime
+    uptime = format_timedelta(now - BOT_START_TIME)
+
+    # Markets currently tracked in price history
+    tracked = len(price_history)
+
+    # Next scheduled run times from the schedule library
+    def next_run_in(job_tag: str) -> str:
+        for job in schedule.jobs:
+            if job_tag in (job.tags or set()):
+                if job.next_run:
+                    delta = job.next_run - now.replace(tzinfo=None)
+                    return format_timedelta(delta)
+        return "unknown"
+
+    # Last run times
+    lr_new = format_last_run(last_run["new_markets"])
+    lr_price = format_last_run(last_run["price_movements"])
+    lr_trend = format_last_run(last_run["trending_scan"])
+    lr_morning = format_last_run(last_run["morning_report"])
+
+    # Next run times
+    nr_new = next_run_in("new_markets")
+    nr_price = next_run_in("price_movements")
+    nr_trend = next_run_in("trending_scan")
+    nr_morning = next_run_in("morning_report")
+
+    return (
+        f"🤖 <b>POLYMARKET BOT STATUS</b>\n"
+        f"⏱ Uptime: {uptime}\n"
+        f"📡 Markets tracked: {tracked}\n\n"
+        f"<b>Last runs:</b>\n"
+        f"  🆕 New market scan: {lr_new}\n"
+        f"  📈 Price movement check: {lr_price}\n"
+        f"  📊 Trending scan: {lr_trend}\n"
+        f"  🌅 Morning report: {lr_morning}\n\n"
+        f"<b>Next runs (approx):</b>\n"
+        f"  🆕 New market scan: in {nr_new}\n"
+        f"  📈 Price movement check: in {nr_price}\n"
+        f"  📊 Trending scan: in {nr_trend}\n"
+        f"  🌅 Morning report: in {nr_morning}"
+    )
+
+
+def poll_telegram_commands() -> None:
+    """Long-poll Telegram for incoming messages and handle /status command.
+    Runs in a background thread — uses offset to avoid processing old messages."""
+    log.info("Telegram command polling started.")
+    offset = 0  # Only process updates newer than this
+
+    # On first start, skip all pending messages so we don't process old ones
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+            params={"timeout": 0, "offset": -1},
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("ok") and data["result"]:
+            offset = data["result"][-1]["update_id"] + 1
+            log.info(f"Skipped old updates; starting from offset {offset}.")
+    except Exception as e:
+        log.warning(f"Could not pre-fetch update offset: {e}")
+
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"timeout": 30, "offset": offset},
+                timeout=40,  # Slightly longer than the Telegram timeout
+            )
+            data = resp.json()
+
+            if not data.get("ok"):
+                log.warning(f"Telegram getUpdates returned non-OK: {data}")
+                time.sleep(5)
+                continue
+
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1  # Advance so we don't re-process
+
+                # Extract message text (works for regular messages and channel posts)
+                message = update.get("message") or update.get("channel_post") or {}
+                text = message.get("text", "").strip()
+                chat_id = str(message.get("chat", {}).get("id", ""))
+
+                if not text or not chat_id:
+                    continue
+
+                # Handle /status (supports /status@botname format)
+                command = text.split("@")[0].lower()
+                if command == "/status":
+                    log.info(f"/status command received from chat {chat_id}")
+                    reply = build_status_message()
+                    send_telegram(reply, chat_id=chat_id)
+
+        except requests.RequestException as e:
+            log.warning(f"Polling error: {e} — retrying in 10s")
+            time.sleep(10)
+        except Exception as e:
+            log.error(f"Unexpected polling error: {e} — retrying in 10s")
+            time.sleep(10)
 
 
 # ---------------------------------------------------------------------------
@@ -397,17 +543,17 @@ def check_price_movements() -> None:
 # ---------------------------------------------------------------------------
 
 def setup_schedule() -> None:
-    # Feature 1: New market alert every 30 minutes
-    schedule.every(30).minutes.do(check_new_markets)
+    # Feature 1: New market alert every 30 minutes (tagged for /status next-run lookup)
+    schedule.every(30).minutes.do(check_new_markets).tag("new_markets")
 
     # Feature 3: Trending scan every 2 hours
-    schedule.every(2).hours.do(trending_market_scan)
+    schedule.every(2).hours.do(trending_market_scan).tag("trending_scan")
 
     # Feature 4: Morning report at 7:00 AM GMT+7 = 00:00 UTC
-    schedule.every().day.at("00:00").do(morning_report)
+    schedule.every().day.at("00:00").do(morning_report).tag("morning_report")
 
     # Feature 5: Price movement check every 15 minutes
-    schedule.every(15).minutes.do(check_price_movements)
+    schedule.every(15).minutes.do(check_price_movements).tag("price_movements")
 
     log.info("All schedules configured.")
 
@@ -426,6 +572,10 @@ if __name__ == "__main__":
     ]
     if missing:
         raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
+
+    # Start the Telegram command polling thread (daemon so it exits with the main process)
+    poll_thread = threading.Thread(target=poll_telegram_commands, daemon=True, name="TelegramPoll")
+    poll_thread.start()
 
     # Run all checks immediately on startup so the user gets instant feedback
     log.info("Running initial checks on startup...")
