@@ -573,6 +573,22 @@ if __name__ == "__main__":
     if missing:
         raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
 
+    # Clear any existing webhook and drop pending updates so we start with a clean slate
+    log.info("Clearing Telegram webhook and pending updates...")
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+            json={"drop_pending_updates": True},
+            timeout=10,
+        )
+        result = resp.json()
+        if result.get("result"):
+            log.info("Telegram webhook cleared and pending updates dropped.")
+        else:
+            log.warning(f"deleteWebhook response: {result}")
+    except requests.RequestException as e:
+        log.warning(f"Could not clear Telegram webhook: {e}")
+
     # Start the Telegram command polling thread (daemon so it exits with the main process)
     poll_thread = threading.Thread(target=poll_telegram_commands, daemon=True, name="TelegramPoll")
     poll_thread.start()
