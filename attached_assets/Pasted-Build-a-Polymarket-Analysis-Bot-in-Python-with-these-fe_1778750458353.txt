@@ -1,0 +1,52 @@
+Build a Polymarket Analysis Bot in Python with these features:
+
+--- FEATURE 1: NEW MARKET ALERT (highest priority) ---
+Every 30 minutes, fetch markets created in the last 2 hours from:
+https://gamma-api.polymarket.com/markets?active=true&limit=50&order=createdAt&ascending=false
+
+Filter for: volume < 5000 AND topic is politics/economics/geopolitics.
+Send Telegram alert immediately with this format:
+
+🆕 NEW MARKET DETECTED
+📌 [Market title]
+💰 YES price: X%
+📊 Volume: $XXX
+⏰ Created: X minutes ago
+🔗 [link]
+💡 Early entry opportunity — low volume, analyze before crowd moves in
+
+--- FEATURE 2: EDGE ANALYSIS via Claude API ---
+For each new or trending market, call Anthropic Claude API (model: claude-sonnet-4-20250514, max_tokens: 500) with this prompt:
+"You are a prediction market analyst. Market: [title]. Current YES price: [price]%. Briefly analyze: 1) What is the realistic probability? 2) Edge = your estimate minus market price. 3) Recommend: BUY YES / BUY NO / SKIP. Be concise, max 150 words."
+
+Include Claude's analysis in the Telegram alert.
+
+--- FEATURE 3: TRENDING MARKET SCAN ---
+Every 2 hours, fetch top 20 markets by volume:
+https://gamma-api.polymarket.com/markets?active=true&limit=20&order=volume&ascending=false
+
+Send Telegram summary of top 5 markets with highest edge.
+
+--- FEATURE 4: MORNING REPORT ---
+Every day at 7:00 AM GMT+7, send a Telegram morning report:
+📊 POLYMARKET MORNING REPORT
+Top 5 markets worth watching today, with YES price and Claude's edge estimate.
+
+--- FEATURE 5: PRICE MOVEMENT ALERT ---
+If a market's YES price moves more than 10% within 1 hour → send alert:
+📈 PRICE SPIKE DETECTED
+[Market] moved from X% to Y% (+Z%)
+This may mean: new information entered the market
+
+--- TECH STACK ---
+- Language: Python
+- Libraries: requests, anthropic, schedule, python-telegram-bot
+- Config via environment variables:
+  ANTHROPIC_API_KEY
+  TELEGRAM_BOT_TOKEN
+  TELEGRAM_CHAT_ID
+
+- Create main.py that runs all features
+- Add clear comments in English
+- Handle API errors gracefully (retry on failure)
+- Store previous prices in a simple dict to detect price movements
