@@ -36,7 +36,7 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 POLYMARKET_BASE = "https://gamma-api.polymarket.com/markets"
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-5"
 
 # In-memory price tracker: market_id -> {price: float, timestamp: datetime, title: str}
 price_history: dict[str, dict] = {}
