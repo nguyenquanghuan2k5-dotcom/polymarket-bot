@@ -44,6 +44,11 @@ price_history: dict[str, dict] = {}
 # Bot startup time (UTC)
 BOT_START_TIME = datetime.now(timezone.utc)
 
+# Daily alert counter — resets at midnight UTC
+DAILY_ALERT_LIMIT = 10
+daily_alert_count = 0
+daily_alert_reset_date = datetime.now(timezone.utc).date()
+
 # Last run timestamps for each feature (UTC), updated after each execution
 last_run: dict[str, datetime | None] = {
     "new_markets": None,
@@ -140,19 +145,63 @@ def yes_price_pct(market: dict) -> float:
     return 0.0
 
 
-def is_politics_economics(market: dict) -> bool:
-    """Heuristic check: does this market relate to politics/economics/geopolitics?"""
-    keywords = [
-        "election", "president", "senate", "congress", "prime minister",
-        "government", "gdp", "inflation", "fed", "interest rate", "recession",
-        "war", "conflict", "nato", "sanction", "tariff", "trade", "treaty",
-        "poll", "vote", "ballot", "economy", "unemployment", "minister",
-        "geopolit", "military", "nuclear", "diplomatic", "un ", "g7", "g20",
-        "trump", "biden", "modi", "xi ", "putin", "zelensky", "macron",
-        "democrat", "republican", "labour", "conservative",
+def is_relevant_market(market: dict) -> bool:
+    """Return True if market is about politics, economics, or geopolitics.
+    Explicitly excludes sports, esports, and entertainment."""
+
+    # --- Inclusion keywords by category ---
+    politics_keywords = [
+        "election", "elected", "president", "presidential", "senate", "senator",
+        "congress", "congressman", "congresswoman", "prime minister", "chancellor",
+        "government", "parliament", "referendum", "impeach", "veto", "legislation",
+        "poll", "vote", "ballot", "democrat", "republican", "labour", "conservative",
+        "trump", "biden", "harris", "modi", "xi jinping", "putin", "zelensky",
+        "macron", "sunak", "scholz", "meloni", "erdogan", "netanyahu", "bolsonaro",
     ]
+    economics_keywords = [
+        "gdp", "inflation", "fed ", "federal reserve", "interest rate", "rate hike",
+        "rate cut", "recession", "unemployment", "cpi", "ppi", "nonfarm", "payroll",
+        "debt ceiling", "budget deficit", "fiscal", "monetary policy", "quantitative",
+        "bitcoin", "ethereum", "crypto", "btc", "eth", "stock market", "s&p 500",
+        "nasdaq", "dow jones", "ipo", "earnings", "tariff", "trade war", "sanction",
+        "oil price", "commodity", "dollar", "yen", "euro", "yuan", "currency",
+    ]
+    geopolitics_keywords = [
+        "war", "ceasefire", "invasion", "missile", "nato", "un security council",
+        "diplomatic", "sanction", "treaty", "alliance", "military", "nuclear",
+        "geopolit", "conflict", "troops", "occupation", "annexation", "insurgency",
+        "g7", "g20", "summit", "bilateral", "international relations", "foreign policy",
+        "taiwan", "ukraine", "russia", "israel", "gaza", "iran", "north korea",
+        "south china sea", "middle east", "european union", "eu ",
+    ]
+    all_include = politics_keywords + economics_keywords + geopolitics_keywords
+
+    # --- Exclusion keywords — veto these topics ---
+    exclude_keywords = [
+        # Sports
+        "nfl", "nba", "mlb", "nhl", "fifa", "uefa", "champions league", "super bowl",
+        "world cup", "premier league", "la liga", "bundesliga", "serie a",
+        "basketball", "football game", "soccer", "tennis", "golf", "formula 1", "f1 race",
+        "olympic", "tour de france", "wimbledon", "ufc", "boxing match",
+        "quarterback", "touchdown", "grand slam", "playoff", "championship game",
+        # Esports
+        "esport", "e-sport", "league of legends", "dota", "valorant", "cs:go",
+        "fortnite", "overwatch", "starcraft", "counter-strike",
+        # Entertainment
+        "oscars", "grammy", "emmy", "golden globe", "academy award",
+        "box office", "movie", "film grossing", "album", "billboard chart",
+        "reality tv", "bachelor", "survivor", "american idol", "got talent",
+        "celebrity", "kardashian", "taylor swift album", "concert tour",
+    ]
+
     text = (market.get("question", "") + " " + market.get("description", "")).lower()
-    return any(kw in text for kw in keywords)
+
+    # Reject if any exclusion keyword matches
+    if any(kw in text for kw in exclude_keywords):
+        return False
+
+    # Accept if any inclusion keyword matches
+    return any(kw in text for kw in all_include)
 
 
 def minutes_ago(created_at_str: str) -> int:
@@ -199,7 +248,22 @@ def format_last_run(ts: datetime | None) -> str:
 # ---------------------------------------------------------------------------
 
 def check_new_markets() -> None:
+    global daily_alert_count, daily_alert_reset_date
     log.info("Checking for new markets...")
+
+    # Reset daily counter at midnight UTC
+    today = datetime.now(timezone.utc).date()
+    if today != daily_alert_reset_date:
+        log.info(f"New day — resetting daily alert count (was {daily_alert_count}).")
+        daily_alert_count = 0
+        daily_alert_reset_date = today
+
+    # Stop early if daily limit already reached
+    if daily_alert_count >= DAILY_ALERT_LIMIT:
+        log.info(f"Daily alert limit ({DAILY_ALERT_LIMIT}) reached. Skipping new market scan.")
+        last_run["new_markets"] = datetime.now(timezone.utc)
+        return
+
     params = {
         "active": "true",
         "limit": 50,
@@ -211,6 +275,11 @@ def check_new_markets() -> None:
 
     alerted = 0
     for market in markets:
+        # Stop as soon as we hit the daily limit
+        if daily_alert_count >= DAILY_ALERT_LIMIT:
+            log.info(f"Daily alert limit ({DAILY_ALERT_LIMIT}) reached mid-scan. Stopping.")
+            break
+
         created_str = market.get("createdAt", "")
         if not created_str:
             continue
@@ -225,8 +294,8 @@ def check_new_markets() -> None:
         if volume >= 5000:
             continue
 
-        # Filter: politics / economics / geopolitics topic
-        if not is_politics_economics(market):
+        # Filter: politics / economics / geopolitics only; exclude sports/esports/entertainment
+        if not is_relevant_market(market):
             continue
 
         title = market.get("question", "Unknown Market")
@@ -248,6 +317,7 @@ def check_new_markets() -> None:
         )
         send_telegram(message)
         alerted += 1
+        daily_alert_count += 1
 
         # Track price for movement alerts
         price_history[market.get("id", title)] = {
@@ -461,10 +531,13 @@ def build_status_message() -> str:
     nr_trend = next_run_in("trending_scan")
     nr_morning = next_run_in("morning_report")
 
+    alerts_remaining = max(0, DAILY_ALERT_LIMIT - daily_alert_count)
+
     return (
         f"🤖 <b>POLYMARKET BOT STATUS</b>\n"
         f"⏱ Uptime: {uptime}\n"
-        f"📡 Markets tracked: {tracked}\n\n"
+        f"📡 Markets tracked: {tracked}\n"
+        f"🔔 Alerts today: {daily_alert_count}/{DAILY_ALERT_LIMIT} ({alerts_remaining} remaining)\n\n"
         f"<b>Last runs:</b>\n"
         f"  🆕 New market scan: {lr_new}\n"
         f"  📈 Price movement check: {lr_price}\n"
